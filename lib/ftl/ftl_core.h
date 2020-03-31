@@ -49,6 +49,7 @@
 #include "ftl_ppa.h"
 #include "ftl_io.h"
 #include "ftl_trace.h"
+#define max_hot 7;
 
 struct spdk_ftl_dev;
 struct ftl_band;

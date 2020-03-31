@@ -444,7 +444,7 @@ ftl_next_write_band(struct spdk_ftl_dev *dev)
 		/* TODO: handle erase failure */
 		return NULL;
 	}
-
+	band->band_data_flag = -1;
 	return band;
 }
 
@@ -458,6 +458,7 @@ ftl_next_wptr_band(struct spdk_ftl_dev *dev)
 	} else {
 		assert(dev->next_band->state == FTL_BAND_STATE_PREP);
 		band = dev->next_band;
+		band->band_data_flag = -1;
 		dev->next_band = NULL;
 	}
 
@@ -729,6 +730,22 @@ ftl_acquire_entry(struct spdk_ftl_dev *dev, int flags)
 	struct ftl_rwb_entry *entry;
 
 	entry = ftl_rwb_acquire(dev->rwb, ftl_rwb_type_from_flags(flags));
+	if (!entry) {
+		return NULL;
+	}
+
+	ftl_evict_cache_entry(dev, entry);
+
+	entry->flags = flags;
+	return entry;
+}
+
+static struct ftl_rwb_entry *
+ftl_acquire_entry_flag(struct spdk_ftl_dev *dev, int flags, int io_flag)
+{
+	struct ftl_rwb_entry *entry;
+
+	entry = ftl_rwb_acquire_flag(dev->rwb, ftl_rwb_type_from_flags(flags), io_flag);
 	if (!entry) {
 		return NULL;
 	}
@@ -1644,7 +1661,7 @@ ftl_wptr_process_writes(struct ftl_wptr *wptr)
 		ftl_wptr_pad_band(wptr);
 	}
 
-	batch = ftl_rwb_pop(dev->rwb);
+	batch = ftl_rwb_pop_flag(dev->rwb, wptr->band->band_data_flag);
 	if (!batch) {
 		/* If there are queued flush requests we need to pad the RWB to */
 		/* force out remaining entries */
@@ -1659,10 +1676,10 @@ ftl_wptr_process_writes(struct ftl_wptr *wptr)
 	if (!io) {
 		goto error;
 	}
-
+	io->io_data_flag = wptr->band->band_data_flag;
 	ppa = wptr->ppa;
-	ftl_rwb_foreach(entry, batch) {
 		/* Update band's relocation stats if the IO comes from reloc */
+	ftl_rwb_foreach(entry, batch) {
 		if (entry->flags & FTL_IO_WEAK) {
 			if (!spdk_bit_array_get(wptr->band->reloc_bitmap, entry->band->id)) {
 				spdk_bit_array_set(wptr->band->reloc_bitmap, entry->band->id);
@@ -1744,7 +1761,7 @@ ftl_rwb_entry_fill(struct ftl_rwb_entry *entry, struct ftl_io *io)
 		entry->ppa = ftl_band_next_ppa(entry->band, io->ppa, io->pos);
 		entry->band->num_reloc_blocks++;
 	}
-
+	
 	entry->trace = io->trace;
 	entry->lba = ftl_io_current_lba(io);
 
@@ -1767,7 +1784,7 @@ ftl_rwb_fill(struct ftl_io *io)
 			continue;
 		}
 
-		entry = ftl_acquire_entry(dev, flags);
+		entry = ftl_acquire_entry_flag(dev, flags, io->io_data_flag);
 		if (!entry) {
 			return -EAGAIN;
 		}
@@ -1964,12 +1981,31 @@ ftl_io_write(struct ftl_io *io)
 	}
 }
 
+void
+ftl_io_write_flag(struct ftl_io *io, int io_flag)
+{
+	struct spdk_ftl_dev *dev = io->dev;
+
+	/* For normal IOs we just need to copy the data onto the rwb */
+	if (!(io->flags & FTL_IO_MD)) {
+		ftl_io_call_foreach_child(io, ftl_rwb_fill_leaf);
+	} else {
+		/* Metadata has its own buffer, so it doesn't have to be copied, so just */
+		/* send it the the core thread and schedule the write immediately */
+		if (ftl_check_core_thread(dev)) {
+			ftl_io_call_foreach_child(io, ftl_submit_write_leaf);
+		} else {
+			spdk_thread_send_msg(ftl_get_core_thread(dev), _ftl_io_write, io);
+		}
+	}
+}
+
 int
 spdk_ftl_write(struct spdk_ftl_dev *dev, struct spdk_io_channel *ch, uint64_t lba, size_t lba_cnt,
 	       struct iovec *iov, size_t iov_cnt, spdk_ftl_fn cb_fn, void *cb_arg)
 {
 	struct ftl_io *io;
-
+	int io_flag;
 	if (iov_cnt == 0) {
 		return -EINVAL;
 	}
@@ -1987,6 +2023,7 @@ spdk_ftl_write(struct spdk_ftl_dev *dev, struct spdk_io_channel *ch, uint64_t lb
 	}
 
 	io = ftl_io_user_init(ch, lba, lba_cnt, iov, iov_cnt, cb_fn, cb_arg, FTL_IO_WRITE);
+	io->io_data_flag = io_flag;
 	if (!io) {
 		return -ENOMEM;
 	}
@@ -1995,8 +2032,7 @@ spdk_ftl_write(struct spdk_ftl_dev *dev, struct spdk_io_channel *ch, uint64_t lb
 	io->level = ch->level;
 	SPDK_DAPULOG("io(i.e., lba + lba_cnt) belongs to level(%d)\n", ch->level);
 #endif
-	ftl_io_write(io);
-
+	ftl_io_write_flag(io, io_flag);
 	return 0;
 }
 

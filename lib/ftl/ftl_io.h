@@ -136,6 +136,7 @@ struct ftl_io_channel {
 
 /* General IO descriptor */
 struct ftl_io {
+	int io_data_flag;
 	/* Device */
 	struct spdk_ftl_dev			*dev;
 

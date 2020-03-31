@@ -439,7 +439,7 @@ ftl_reloc_io_init(struct ftl_band_reloc *breloc, struct ftl_reloc_move *move,
 		.data		= move->data,
 		.cb_fn		= fn,
 	};
-
+	io->io_data_flag = breloc->band->band_data_flag;
 	io = ftl_io_init_internal(&opts);
 	if (!io) {
 		return NULL;

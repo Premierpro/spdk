@@ -39,6 +39,7 @@
 #include "ftl_core.h"
 
 struct ftl_rwb_batch {
+	int batch_data_flag;
 	/* Parent RWB */
 	struct ftl_rwb				*rwb;
 
@@ -102,7 +103,8 @@ struct ftl_rwb {
 	struct spdk_ring			*submit_queue;
 	/* High-priority batch queue */
 	struct spdk_ring			*prio_queue;
-
+	/*store the batch from the two queues*/
+	struct spdk_ring            *backup_queue;
 	/* Batch buffer */
 	struct ftl_rwb_batch			*batches;
 
@@ -180,7 +182,7 @@ ftl_rwb_batch_init(struct ftl_rwb *rwb, struct ftl_rwb_batch *batch, unsigned in
 			return -1;
 		}
 	}
-
+	batch->batch_data_flag = -1;
 	return 0;
 }
 
@@ -227,6 +229,14 @@ ftl_rwb_init(const struct spdk_ftl_conf *conf, size_t xfer_size, size_t md_size,
 					   spdk_align32pow2(rwb->num_batches + 1),
 					   SPDK_ENV_SOCKET_ID_ANY);
 	if (!rwb->prio_queue) {
+		SPDK_ERRLOG("Failed to create high-prio submission queue\n");
+		goto error;
+	}
+
+	rwb->backup_queue = spdk_ring_create(SPDK_RING_TYPE_MP_SC,
+					   spdk_align32pow2(rwb->num_batches + 1),
+					   SPDK_ENV_SOCKET_ID_ANY);
+	if (!rwb->backup_queue) {
 		SPDK_ERRLOG("Failed to create high-prio submission queue\n");
 		goto error;
 	}
@@ -286,6 +296,7 @@ ftl_rwb_free(struct ftl_rwb *rwb)
 	pthread_spin_destroy(&rwb->lock);
 	spdk_ring_free(rwb->submit_queue);
 	spdk_ring_free(rwb->prio_queue);
+	spdk_ring_free(rwb->backup_queue);
 	free(rwb->batches);
 	free(rwb);
 }
@@ -308,6 +319,7 @@ ftl_rwb_batch_release(struct ftl_rwb_batch *batch)
 	}
 
 	pthread_spin_lock(&rwb->lock);
+	batch->batch_data_flag = -1;
 	STAILQ_INSERT_TAIL(&rwb->free_queue, batch, stailq);
 	rwb->num_free_batches++;
 	pthread_spin_unlock(&rwb->lock);
@@ -474,6 +486,57 @@ error:
 	return NULL;
 }
 
+struct ftl_rwb_entry *
+ftl_rwb_acquire_flag(struct ftl_rwb *rwb, enum ftl_rwb_entry_type type, int io_flag)
+{
+	struct ftl_rwb_entry *entry = NULL;
+	struct ftl_rwb_batch *current, *temp;
+
+	if (ftl_rwb_check_limits(rwb, type)) {
+		return NULL;
+	}
+
+	pthread_spin_lock(&rwb->lock);
+
+	STAILQ_FOREACH_SAFE(current, &rwb->active_queue, stailq, temp){
+		if(current->batch_data_flag == -1 || current->batch_data_flag == io_flag)
+			break;
+	}
+	if (!current || (current->batch_data_flag != io_flag && current->batch_data_flag != -1)) {
+		current = _ftl_rwb_acquire_batch(rwb);
+		current->batch_data_flag = io_flag;
+		if (!current) {
+			goto error;
+		}
+	}
+	else
+		current->batch_data_flag = io_flag;
+	
+	entry = &current->entries[current->num_acquired++];
+
+	if (current->num_acquired >= rwb->xfer_size) {
+		/* If the whole batch is filled, */
+		/* remove the current batch from active_queue */
+		/* since it will need to move to submit_queue */
+		STAILQ_REMOVE(&rwb->active_queue, current, ftl_rwb_batch, stailq);
+		rwb->num_active_batches--;
+	} else if (current->num_acquired % rwb->interleave_offset == 0) {
+		/* If the current batch is filled by the interleaving offset, */
+		/* move the current batch at the tail of active_queue */
+		/* to place the next logical blocks into another batch. */
+		STAILQ_REMOVE(&rwb->active_queue, current, ftl_rwb_batch, stailq);
+		STAILQ_INSERT_TAIL(&rwb->active_queue, current, stailq);
+	}
+
+	pthread_spin_unlock(&rwb->lock);
+	__atomic_fetch_add(&rwb->num_acquired[type], 1, __ATOMIC_SEQ_CST);
+	__atomic_fetch_add(&rwb->num_pending, 1, __ATOMIC_SEQ_CST);
+	return entry;
+error:
+	pthread_spin_unlock(&rwb->lock);
+	return NULL;
+}
+
 void
 ftl_rwb_disable_interleaving(struct ftl_rwb *rwb)
 {
@@ -490,7 +553,7 @@ ftl_rwb_disable_interleaving(struct ftl_rwb *rwb)
 
 			assert(batch->num_ready == 0);
 			assert(batch->num_acquired == 0);
-
+			batch->batch_data_flag = -1;
 			STAILQ_INSERT_TAIL(&rwb->free_queue, batch, stailq);
 			rwb->num_free_batches++;
 		}
@@ -516,6 +579,51 @@ ftl_rwb_pop(struct ftl_rwb *rwb)
 						 __ATOMIC_SEQ_CST);
 		assert(num_pending > 0);
 		return batch;
+	}
+
+	return NULL;
+}
+
+struct ftl_rwb_batch *
+ftl_rwb_pop_flag(struct ftl_rwb *rwb, int io_flag)
+{
+	struct ftl_rwb_batch *batch = NULL, *batch1 = NULL;
+	unsigned int num_pending __attribute__((unused));
+
+	while(1){
+		if (spdk_ring_dequeue(rwb->prio_queue, (void **)&batch, 1) == 1) {
+			num_pending = __atomic_fetch_sub(&rwb->num_pending, rwb->xfer_size,
+						 __ATOMIC_SEQ_CST);
+			assert(num_pending > 0);
+			if(batch->batch_data_flag == io_flag || io_flag == -1){
+				while(spdk_ring_dequeue(rwb->backup_queue, (void **)&batch1, 1)){
+					spdk_ring_enqueue(rwb->prio_queue, (void **)&batch1, 1, NULL);
+				}
+				return batch;
+			}
+			else
+				spdk_ring_enqueue(rwb->backup_queue, (void **)&batch, 1, NULL);
+		}
+		else
+			break;
+	}
+
+	while(1){
+		if (spdk_ring_dequeue(rwb->submit_queue, (void **)&batch, 1) == 1) {
+			num_pending = __atomic_fetch_sub(&rwb->num_pending, rwb->xfer_size,
+						 __ATOMIC_SEQ_CST);
+			assert(num_pending > 0);
+			if(batch->batch_data_flag == io_flag || io_flag == -1){
+				while(spdk_ring_dequeue(rwb->backup_queue, (void **)&batch1, 1)){
+					spdk_ring_enqueue(rwb->submit_queue, (void **)&batch1, 1, NULL);
+				}
+				return batch;
+			}
+			else
+				spdk_ring_enqueue(rwb->backup_queue, (void **)&batch, 1, NULL);
+		}
+		else
+			break;
 	}
 
 	return NULL;

@@ -151,6 +151,7 @@ struct ftl_lba_map_request {
 };
 
 struct ftl_band {
+	int band_data_flag;
 	/* Device this band belongs to */
 	struct spdk_ftl_dev			*dev;
 
