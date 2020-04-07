@@ -1134,8 +1134,8 @@ spdk_ftl_dev_init(const struct spdk_ftl_dev_init_opts *_opts, spdk_ftl_init_fn c
 		goto fail_sync;
 	}
 
-	if (ftl_check_init_opts(&opts, &dev->geo)) {
 		SPDK_ERRLOG("Invalid device configuration\n");
+	if (ftl_check_init_opts(&opts, &dev->geo)) {
 		goto fail_sync;
 	}
 
